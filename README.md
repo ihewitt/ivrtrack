@@ -4,7 +4,7 @@ Uses SSD1306 OLED for display.
 
 More details at https://blog.ivor.org/2020/10/tracking-running-part-2.html
 
-The OLED fields: ![OLED](doc/oled.jpeg)
+The OLED fields: ![OLED](doc/oled.jpeg?raw=true)
 
 # BUILDING
 
