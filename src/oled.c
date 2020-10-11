@@ -155,7 +155,7 @@ void OLED_invert(bool invert) { sendCmd1(SET_NORM_INV | (invert & 1)); }
 // draw to locations 16 x 8
 void OLED_clear() { memset(scrn_buffer, 0x0, scrn_pages * SCREEN_WIDTH); };
 
-void OLED_init(void) {
+bool OLED_init(void) {
   i2c_init();
 
   OS_Sleep(100);
@@ -185,8 +185,9 @@ void OLED_init(void) {
 
   scrn_pages  = SCREEN_HEIGHT / 8;
   scrn_buffer = (uint8_t*)malloc(scrn_pages * SCREEN_WIDTH);
-
+  if (!scrn_buffer) return false;
   OLED_clear();
+  return true;
 }
 
 void OLED_show() {

@@ -6,7 +6,7 @@ void OLED_off();
 void OLED_on();
 void OLED_clear();
 void OLED_invert(bool invert);
-void OLED_init(void);
+bool OLED_init(void);
 void OLED_show();
 
 void drawIcon(int x, int y, int id);

@@ -1,12 +1,17 @@
 /*
  * IVRTrac GPS Tracker software for A9G board
  * © Ivor Hewitt 2020, GPL2
+ *
  * Features:
  * sends tk102 "style" location updates.
- * requires either a custom server (add link) or modified GPS format string to use
- * generic server.
+ * requires either a custom server (https://github.com/ihewitt/gps-server) or a modified GPS
+ * format string to use generic server.
  * Uses an SSD1306 OLED, power circuit "patch", and preferably
  * power source board. see (https://blog.ivor.org/2020/10/tracking-running-part-2.html)
+ */
+
+/*
+ * Update SERVER_ADDRESS and SERVER_PORT as suitable
  */
 
 // TODO check processor speed options for battery life and stability.
@@ -52,6 +57,8 @@
 #define GPS_FASTFIX
 //#define GPS_AGPSFIX
 
+#undef VERBOSE // Excessive logging
+
 #define CONFIG_FILE_NAME  "/t/config.txt"
 #define GPS_LOG_FILE_PATH "/t/gps-current.log"
 #define GPS_LOG_FILE      "/t/debug.log"
@@ -63,8 +70,8 @@
 #define MAIN_TASK_NAME       "Main Task"
 
 #define SERVER_ADDRESS   ""
-#define SERVER_PORT      8080
-#define SOFT_VERSION     "V0.5.2"
+#define SERVER_PORT      8181
+#define SOFT_VERSION     "V0.5.3"
 #define FOTA_HTTP_SERVER "https://" SERVER_ADDRESS "/fota/%stonew.pack"
 
 const char timeServer[] = "time.nist.gov"; // time.nist.gov NTP server
@@ -166,9 +173,11 @@ void    ImeiRead() {
 }
 
 // Used to hold screen current state message
+#define MSG_RUN "Running"
+
 char stateMsg[32] = {0}; // TODO tidy
 
-void updateScreen() {
+void updateScreen(char* msg) {
   OLED_clear();
 
   if (gps_on) drawIcon(2, 0, ICON_GPS);
@@ -197,9 +206,19 @@ void updateScreen() {
   else
     drawIcon(14, 6, ICON_BAT_L);
 
-  drawString(0, 3, stateMsg);
+  drawString(0, 2, msg);
 
   OLED_show();
+}
+
+void refreshScreen() { updateScreen(stateMsg); }
+
+// Turn off oled before shutdown
+bool StoreCache(uint8_t*);
+void PowerOff() {
+  OLED_off();
+  StoreCache(sdbuffer); // Try to save any non uploaded data
+  PM_ShutDown();
 }
 
 // TODO rework this mess
@@ -235,8 +254,8 @@ bool ReadConfig() {
   len = API_FS_GetFileSize(fd);
   Output("File size %s, %d", path, len);
 
-  uint8_t* text = OS_Malloc(len + 16);
-  memset(text, 0, len + 1);
+  uint8_t* text = OS_Malloc(len + 2);
+  memset(text, 0, len + 2);
   uint32_t lenread = API_FS_Read(fd, text, len);
   strcat(text, "\n");
   API_FS_Close(fd);
@@ -340,7 +359,7 @@ void RollLog() {
 }
 
 // Flush any cache to SD
-bool SaveToSD() {
+bool SaveToSDLog() {
   int32_t  fd;
   uint8_t* path = (uint8_t*)GPS_LOG_FILE_PATH;
   bool     ret  = true;
@@ -355,7 +374,7 @@ bool SaveToSD() {
   int64_t logsize = API_FS_GetFileSize(fd);
   API_FS_Close(fd);
 
-  if (!ret) { Output("SaveToSD: Open gps file %s failed:%d", path, fd); }
+  if (!ret) { Output("SaveToSDLog: Open gps file %s failed:%d", path, fd); }
 
   if (logsize > ROLL_SIZE) RollLog();
 
@@ -391,9 +410,8 @@ bool ClearSD(bool gpsdata) {
     }
     API_FS_CloseDir(dir);
     // Since state data removed, need to reboot
-    sprintf(stateMsg, "Wiped, rebootingin 6 seconds...");
     OLED_on();
-    updateScreen();
+    updateScreen("Wiped, rebooting\nin 6 seconds...");
     OS_Sleep(6000);
     PM_Restart();
   }
@@ -403,19 +421,35 @@ bool ClearSD(bool gpsdata) {
 //
 // Cache gps, (e.g. out of mobile signal for a period, so store to SD cache.)
 //
+bool StoreCache(uint8_t* buffer) {
+  bool ret;
+
+  int len = strlen(buffer);
+  if (len == 0) // nothing to do
+    return true;
+
+  int32_t fs = API_FS_Open("/t/cache", FS_O_RDWR | FS_O_APPEND | FS_O_CREAT, 0);
+  if (fs <= 0) {
+    ret = false;
+  } else {
+    if (API_FS_Write(fs, (uint8_t*)buffer, len) > 0) {
+      dsk_on = true; // caching to sd icon
+      ret    = true;
+    } else
+      ret = false;
+    API_FS_Close(fs);
+  }
+  return ret;
+}
+
 bool CacheGPS(char* str) {
 
   if (strlen(sdbuffer) + strlen(str) > BUFFER_SIZE) {
     // Full unflushed buffer, try to backup
-    Output("Caching unsent to SD");
-    int32_t fs = API_FS_Open("/t/cache", FS_O_RDWR | FS_O_APPEND | FS_O_CREAT, 0);
-    if (fs <= 0) {
-      Output("Unable to store SD cache");
-    } else {
-      API_FS_Write(fs, (uint8_t*)sdbuffer, strlen(sdbuffer));
-      API_FS_Close(fs);
-      dsk_on = true; // caching to sd icon
-    }
+    if (!StoreCache(sdbuffer)) Output("Unable to cache, discarded");
+    else
+      Output("Cached unsent to SD");
+
     sdbuffer[0] = 0;
   }
   strcat(sdbuffer, str);
@@ -501,7 +535,7 @@ void HandleGps() {
 
   if ((last_state != gps_on) || (gps_num != num)) {
     gps_num = num;
-    updateScreen();
+    refreshScreen();
   }
 
   gpstimer += NMEA_INTERVAL; // nmea is every 10 seconds.
@@ -521,37 +555,32 @@ void HandleGps() {
   }
 
   char datestr[14];
-  char satstr[128];
-  char locstr[64];
-  char batstr[12];
-
   sprintf(datestr, "%02d%02d%02d%02d%02d%02d", gpsInfo->rmc.date.year, gpsInfo->rmc.date.month, gpsInfo->rmc.date.day,
           gpsInfo->rmc.time.hours, gpsInfo->rmc.time.minutes, gpsInfo->rmc.time.seconds);
 
   uint8_t  percent;
   uint16_t v = PM_Voltage(&percent);
-  snprintf(batstr, sizeof(batstr), "%dmV, %d\%", v, percent);
 
+#ifdef VERBOSE
+  char satstr[128];
+  char locstr[64];
+  char batstr[12];
+
+  snprintf(batstr, sizeof(batstr), "%dmV, %d\%", v, percent);
   snprintf(satstr, sizeof(satstr),
            "gsa: %d,%d "
            "qu: %d trk: %d tot: %d fix: %s %d",
            gpsInfo->gsa[0].fix_type, gpsInfo->gsa[1].fix_type, gpsInfo->gga.fix_quality, gpsInfo->gga.satellites_tracked,
            gpsInfo->gsv[0].total_sats, isFixedStr, isFixed);
-
   snprintf(locstr, sizeof(locstr), "Lat:%3.5f, Lon:%3.5f, alt:%5.2f", latitude, longitude, altitude);
 
   Output("GPS: [%s] %s %s %s", datestr, satstr, locstr, batstr);
+#endif
 
   // TODO rework logic, can we get a "we have good enough information fix?"
-  char fix = 'V';
-  //   if (((gpsInfo->gga.satellites_tracked >= 3) &&
-  //        (gpsInfo->rmc.date.year != 80)) ||
-  //       isFixed > 1)
-  //     fix = 'A';
+  char fix = (isFixed > 1) ? 'A' : 'V'; // Use the format lots of trackers use
 
-  if (isFixed > 1) fix = 'A';
-
-  char message[128];
+  char message[128]; // more than enough, usually ~78
   snprintf(message, sizeof(message),
            "*IVR,%s,"
            "%s," // YYMMDDMMHHSS
@@ -591,7 +620,7 @@ bool handleCommand(bool  verbose, // verbose - sms or uart
   {
     // Callback to shutdown so event removed from queue
     strcpy(response, "Poweroff in 5s");
-    OS_StartCallbackTimer(mainTaskHandle, 5000, PM_ShutDown, NULL);
+    OS_StartCallbackTimer(mainTaskHandle, 5000, PowerOff, NULL);
   } else if (strnicmp(command, "reboot", 5) == 0) // Reboot
   {
     strcpy(response, "Reboot in 5s");
@@ -657,89 +686,86 @@ bool handleCommand(bool  verbose, // verbose - sms or uart
   return true; // handled
 }
 
-static uint32_t button_time = 0;
-void            EventDispatch(API_Event_t* pEvent) {
+static bool button_down = false;
+void        KeyHandler() {
+  static uint32_t button_time = 0;
+  if (button_time > 20) { // seems to be a button up on poweron
+    button_time = 0;
+    return;
+  }
+  button_time++;
+  int sec = (button_time / 2);
+
+  if (button_down) {
+    // Power off
+    if (sec > 5) // shutdown
+    {
+      OLED_on();
+      updateScreen("Power off!");
+      OS_Sleep(3000); // Quickly display message
+      PowerOff();
+    } else if (sec > 1) // Just warn
+    {
+      OLED_on();
+      char saveMsg[32];
+      sprintf(saveMsg, "Power off in %d", 6 - sec);
+      updateScreen(saveMsg);
+    }
+    OS_StartCallbackTimer(mainTaskHandle, 500, KeyHandler, NULL); // Keep ticking
+  } else {
+    {
+      button_time = 0;
+      bool oled   = OLED_state();
+      if (oled) {
+        OLED_off();
+      } else {
+        OLED_on();
+        refreshScreen();
+      }
+    }
+  }
+}
+
+void EventNetwork(API_Event_t* pEvent) {
   switch (pEvent->id) {
-    case API_EVENT_ID_SIGNAL_QUALITY:
-      // param1: SQ(0~31,99(unknown)), param2:RXQUAL(0~7,99(unknown))  (RSSI = SQ*2-113)
+      // TODO move network logic into network handler
+    case API_EVENT_ID_NETWORK_REGISTER_SEARCHING: //
+      Output("network register searching");
       break;
-
-    case API_EVENT_ID_POWER_INFO:
-      ////param1: (PM_Charger_State_t<<16|charge_level(%)) , param2:
-      ///(PM_Battery_State_t<<16|battery_voltage(mV))
-      break;
-
-    case API_EVENT_ID_NETWORK_GOT_TIME: // Do we need to tell rtc/gps?
-      nettime = true;
-      RTC_Time_t time;
-      TIME_GetRtcTime(&time);
-      Output("Time: %04d%02d%02d-%02d%02d%02d", time.year, time.month, time.day, time.hour, time.minute, time.second);
-      break;
-
-    case API_EVENT_ID_KEY_DOWN:
-      if (pEvent->param1 == KEY_POWER) {
-        Flash(100);
-        button_time = TIME_GetTime();
-      }
-      break;
-
-    case API_EVENT_ID_KEY_UP: // Toggle screen on and off
-      if (pEvent->param1 == KEY_POWER) {
-        button_time = TIME_GetTime() - button_time;
-        if (button_time >= 0 && button_time < 5) { // turn screen on <5s
-          bool oled = OLED_state();
-          if (oled) {
-            OLED_off();
-          } else {
-            OLED_on();
-            updateScreen();
-          }
-        } else if (button_time > 5 && button_time < 10) // sanity we also get button up on poweron!
-        {
-          OLED_on();
-          sprintf(stateMsg, "Power off!");
-          updateScreen();
-          OS_Sleep(3000); // Quickly display message
-          OLED_off();
-          PM_ShutDown();
-        }
-      }
-      break;
-
-    case API_EVENT_ID_SYSTEM_READY:
-      Output("system initialize complete");
-      initialised = true;
-      break;
-
-    case API_EVENT_ID_NO_SIMCARD:
-      Output("!!NO SIM CARD%d!!!!", pEvent->param1);
-      sprintf(stateMsg, "NO SIM CARD!");
-      updateScreen();
-      break;
-
-    case API_EVENT_ID_NETWORK_REGISTER_SEARCHING: Output("network register searching"); break;
 
     case API_EVENT_ID_NETWORK_REGISTER_DENIED: // Is this happening when changing towers/networks?
       Output("network register denied");       // any way to resolve this?
     case API_EVENT_ID_NETWORK_REGISTER_NO:
       Output("network register no");
       mob_on = false;
-      updateScreen();
+      refreshScreen();
       break;
 
     case API_EVENT_ID_NETWORK_REGISTERED_HOME:
     case API_EVENT_ID_NETWORK_REGISTERED_ROAMING: {
       Output("Registered"); // now attach
+
+      Network_Register_Mode_t mode;
+      uint8_t                 operatorId[6];
+      Network_GetCurrentOperator(operatorId, &mode);
+      Output("Current operator: %02x.%02x.%02x.%02x.%02x.%02x", //
+             operatorId[0], operatorId[1], operatorId[2], operatorId[3], operatorId[4], operatorId[5]);
+
       mob_on = true;
-      updateScreen();
+      refreshScreen();
+
       uint8_t status = 0; // do we need to attach or reactivate?
-      if (Network_GetAttachStatus(&status)) Output("GetAttach %d vs attach %d", status, netAttach);
-      if (!netAttach || status == 0)
+      if (Network_GetAttachStatus(&status)) Output("GetAttach %d vs attachflag %d", status, netAttach);
+      if (status == 0) {
         if (!Network_StartAttach()) Trace(1, "network attach fail");
-      break;
+
+        break;
+      }
+      // drop through
+      // break;
     }
     case API_EVENT_ID_NETWORK_ATTACHED: {
-      Output("Attached");
+      if (pEvent->id == API_EVENT_ID_NETWORK_ATTACHED) Output("Attached");
       netAttach = true;
 
       Output("Activate %s %s %s", config.apn, config.apnuser, config.apnpwd);
@@ -755,7 +781,7 @@ void            EventDispatch(API_Event_t* pEvent) {
     case API_EVENT_ID_NETWORK_ACTIVATE_FAILED:
       Output("Activated off");
       dat_on = false;
-      updateScreen();
+      refreshScreen();
       break;
 
     case API_EVENT_ID_NETWORK_DETACHED:
@@ -767,20 +793,89 @@ void            EventDispatch(API_Event_t* pEvent) {
     case API_EVENT_ID_NETWORK_ATTACH_FAILED:
       netAttach = false;
       Output("Attach failed."); // reattach?
-      //    Network_StartDetach(); //?is this automatic?
+      // Network_StartDetach(); // ?is this automatic?
       break;
 
-    case API_EVENT_ID_NETWORK_ACTIVATED: // go! we have connection
-      Output("network activate success");
-      dat_on = true;
-      updateScreen();
+    case API_EVENT_ID_NETWORK_ACTIVATED: // go! we have gprs connection
+      dat_on = true;                     // data connection up
+      Output("network activate success, connect");
+      refreshScreen();
 
-      Network_Register_Mode_t mode;
-      uint8_t                 operatorId[6];
-      Network_GetCurrentOperator(operatorId, &mode);
-      Output("Current operator: %02x.%02x.%02x.%02x.%02x.%02x", operatorId[0], operatorId[1], operatorId[2], operatorId[3],
-             operatorId[4], operatorId[5]);
+      // Lookup server ip once if we need it.
+      if (strlen(config.server_ip) == 0) {
+        memset(config.server_ip, 0, sizeof(config.server_ip));
+        if (DNS_GetHostByName2(config.server, config.server_ip) != 0) {
+          Output("Get Host fail");
+          break;
+        }
+      }
       break;
+
+    case API_EVENT_ID_NETWORK_CELL_INFO: {
+      uint8_t             number   = pEvent->param1;
+      Network_Location_t* location = (Network_Location_t*)pEvent->pParam1;
+      break;
+    }
+
+    default: break;
+  }
+}
+
+void EventDispatch(API_Event_t* pEvent) {
+  switch (pEvent->id) {
+
+    case API_EVENT_ID_SYSTEM_READY:
+      Output("system initialize complete");
+      initialised = true;
+      break;
+
+    case API_EVENT_ID_NO_SIMCARD:
+      Output("!!NO SIM CARD%d!!!!", pEvent->param1);
+      sprintf(stateMsg, "NO SIM CARD!");
+      refreshScreen();
+      break;
+
+    case API_EVENT_ID_SIGNAL_QUALITY:
+      // param1: SQ(0~31,99(unknown)), param2:RXQUAL(0~7,99(unknown))  (RSSI = SQ*2-113)
+      break;
+
+    case API_EVENT_ID_POWER_INFO:
+      ////param1: (PM_Charger_State_t<<16|charge_level(%)) , param2:
+      ///(PM_Battery_State_t<<16|battery_voltage(mV))
+      break;
+
+    case API_EVENT_ID_NETWORK_GOT_TIME: // Do we need to tell rtc/gps?
+      nettime = true;
+      RTC_Time_t time;
+      TIME_GetRtcTime(&time);
+      Output("GSM Time: %04d%02d%02d-%02d%02d%02d", //
+             time.year, time.month, time.day, time.hour, time.minute, time.second);
+      break;
+
+    case API_EVENT_ID_KEY_DOWN: // Start a keypress handler
+      if (pEvent->param1 == KEY_POWER && !button_down) {
+        button_down = true;
+        OS_StartCallbackTimer(mainTaskHandle, 500, KeyHandler, NULL);
+      }
+      break;
+
+    case API_EVENT_ID_KEY_UP: // Toggle screen on and off
+      if (pEvent->param1 == KEY_POWER) { button_down = false; }
+      break;
+
+    case API_EVENT_ID_NETWORK_AVAILABEL_OPERATOR: break;
+
+    case API_EVENT_ID_NETWORK_REGISTER_SEARCHING:
+    case API_EVENT_ID_NETWORK_REGISTER_DENIED:
+    case API_EVENT_ID_NETWORK_REGISTER_NO:
+    case API_EVENT_ID_NETWORK_REGISTERED_HOME:
+    case API_EVENT_ID_NETWORK_REGISTERED_ROAMING:
+    case API_EVENT_ID_NETWORK_ATTACHED:
+    case API_EVENT_ID_NETWORK_DEACTIVED:
+    case API_EVENT_ID_NETWORK_ACTIVATE_FAILED:
+    case API_EVENT_ID_NETWORK_DETACHED:
+    case API_EVENT_ID_NETWORK_ATTACH_FAILED:
+    case API_EVENT_ID_NETWORK_ACTIVATED: EventNetwork(pEvent); break;
 
     case API_EVENT_ID_SMS_SENT: Output("Send Message Success"); break;
 
@@ -833,19 +928,15 @@ void            EventDispatch(API_Event_t* pEvent) {
           break;
         }
       }
-
       break;
     }
 
-    case API_EVENT_ID_NETWORK_AVAILABEL_OPERATOR: break;
-
-    case API_EVENT_ID_GPS_UART_RECEIVED: {
+    case API_EVENT_ID_GPS_UART_RECEIVED:
       // Trace(1, "received GPS data,length:%d, data:%s", pEvent->param1, pEvent->pParam1);
       GPS_Update(pEvent->pParam1, pEvent->param1);
-      if (!gpsReady) // Ignore until we're ready
-        return;
-      HandleGps();
-    } break;
+      if (gpsReady) // Ignore until we're ready
+        HandleGps();
+      break;
 
     case API_EVENT_ID_UART_RECEIVED:
       if (pEvent->param1 == UART1) {
@@ -861,23 +952,22 @@ void            EventDispatch(API_Event_t* pEvent) {
         }
       }
       break;
-
-    default: Output("** Unhandled event %d", pEvent->id); break;
+    default: break;
   }
 }
 
 /*
- * Read GPSLOG file, upload to server
- * rename as timestamped
+ * Connect and send data, synchronous connection code
  */
-bool UploadToServer(char* data, int len) {
+bool UploadToServer(char* data) {
   bool ret = true;
+  int  len = strlen(data);
 
   // Connect
   int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (fd < 0) {
     Output("Create socket fail"); // not sure how this could ever fail?
-    return false;
+    return false;                 // seems it can
   }
 
   LED_data(true);
@@ -891,19 +981,32 @@ bool UploadToServer(char* data, int len) {
   int retval = connect(fd, (struct sockaddr*)&sockaddr, sizeof(struct sockaddr_in));
 
   if (retval < 0) {
-    Output("Socket connect fail");
+    Output("Socket connect fail %d ip:%s, port:%d", retval, config.server_ip, config.port);
     ret = false;
   } else {
-    // Write
-    Output("Writing %d bytes.", len); //, data);
-    retval = send(fd, data, len, 0);
-    if (retval < 0) {
-      Output("socket write fail:%d", retval);
-      ret = false;
+    // Tokenise and write each line
+    char* curs = data;
+    char* line;
+    int   llen;
+    while ((line = strsep(&curs, "\n")) && (llen = strlen(line))) {
+#ifdef VERBOSE
+      Output("Writing %d bytes. '%s'", llen, line);
+#endif
+      retval = send(fd, line, llen, 0);
+      if (retval < 0) {
+        Output("socket write fail:%d", retval);
+        line[llen] = '\n'; // detokenize this line
+        curs       = line; // set cursor back to line start
+        ret        = false;
+        break;
+      }
     }
+    if (!ret && curs != data) // If failed but still copied some, remove from buffer
+    {
+      memcpy(data, curs, len - (curs - data));
+    }
+    close(fd);
   }
-  close(fd);
-
   LED_data(false);
   return ret;
 }
@@ -933,7 +1036,7 @@ void InitialiseGPS() {
   uint8_t retries;
 
   // Supposed to support SBAS so lets try that.
-  //  if (!GPS_SetSBASEnable(true)) Output("enable sbas fail");
+  if (!GPS_SetSBASEnable(true)) Output("enable sbas fail");
 
   char version[64]; // scratch space
   if (!GPS_GetVersion(version, 64)) Output("get gps firmware version fail");
@@ -958,8 +1061,8 @@ void InitialiseGPS() {
 
   // why is this done 5 times? does every gps call need this??
   for (retries = 0; retries < 5; ++retries) {
-    // ret = GPS_SetSearchMode(true, true, false, true); // gps, glonass, galileo?
-    ret = GPS_SetSearchMode(true, false, false, false); // just enable gps
+    ret = GPS_SetSearchMode(true, true, false, true); // gps, glonass, galileo?
+    // ret = GPS_SetSearchMode(true, false, false, false); // just enable gps
     if (ret) break;
     else
       OS_Sleep(1000);
@@ -968,8 +1071,7 @@ void InitialiseGPS() {
 
   // Try fast start from cached last known location if we know one
   if (state.latitude != 0 && state.longitude != 0) {
-    strcpy(stateMsg, "GPS hot start");
-    updateScreen();
+    updateScreen("GPS hot start");
 
     RTC_Time_t now;
     TIME_GetRtcTime(&now);
@@ -991,8 +1093,7 @@ void InitialiseGPS() {
     Output("Set fastfix %s (%d tries)", ret ? "ok" : "fail", retries);
 #endif
   } else {
-    strcpy(stateMsg, "GPS cold start");
-    updateScreen();
+    updateScreen("GPS cold start");
   }
   // set gps output interval
   for (retries = 0; retries < 5; ++retries) { // why is this done 5 times?
@@ -1045,27 +1146,26 @@ fail:
 void gprs_Task(void* pData) {
   LED_Blink(pData); // Set the LED timer going, 1sec blink to start
 
+  strcpy(stateMsg, "Wait for init");
+  refreshScreen();
+
   uint8_t status;
   while (!initialised) OS_Sleep(1000);
 
   ImeiRead(); // Populate global imei
 
-  // 60 seconds might be too quick, try 2 min?
-  WatchDog_Open(WATCHDOG_SECOND_TO_TICK(60 * 2));
+  // 60 seconds might be too quick, try 3 min?
+  // If we can't get GPRS in this time, start over
+  WatchDog_Open(WATCHDOG_SECOND_TO_TICK(60 * 3));
 
-  strcpy(stateMsg, "GPRS Connect");
-  updateScreen();
+  strcpy(stateMsg, "GPRS Connect"); //
+  refreshScreen();
   Output("Wait for GPRS activation");
 
   while (!dat_on) OS_Sleep(1000);
   Output("GPRS connected");
-
-  // Lookup server ip once if we need it.
-  // we don't expect it to change.
-  if (strlen(config.server_ip) == 0) {
-    memset(config.server_ip, 0, sizeof(config.server_ip));
-    if (DNS_GetHostByName2(config.server, config.server_ip) != 0) { Output("Get Host fail"); }
-  }
+  strcpy(stateMsg, "Connected");
+  refreshScreen();
 
   // If no network time, get from NTP
   RTC_Time_t time;
@@ -1088,15 +1188,15 @@ void gprs_Task(void* pData) {
   }
 
   TIME_GetRtcTime(&time);
-  Output("Time is: %04d%02d%02d-%02d%02d%02d", time.year, time.month, time.day, time.hour, time.minute, time.second);
+  Output("Time: %02d/%02d/%04d %02d:%02d:%02d", time.day, time.month, time.year, time.hour, time.minute, time.second);
 
-  strcpy(stateMsg, "GPS Start");
-  updateScreen();
+  strcpy(stateMsg, "GPS Start"); // Start GPS ASAP, power issue seems ok now with power capacitors
+  refreshScreen();
   InitialiseGPS();
 
-  SetFlash(6, 1, 1000);        // All good, nice steady blink
-  strcpy(stateMsg, "Running"); // TODO Consolidate the display messages.
-  updateScreen();
+  SetFlash(6, 1, 1000);      // All good, nice steady blink
+  strcpy(stateMsg, MSG_RUN); // TODO Consolidate the display messages.
+  refreshScreen();
 
   // Activate screen timeout
   OS_StartCallbackTimer(mainTaskHandle, 1000 * config.screentime, OLED_off,
@@ -1104,7 +1204,7 @@ void gprs_Task(void* pData) {
 
   char msg[64];
   sprintf(msg, "*IVR:%s#", imei);
-  UploadToServer(msg, strlen(msg)); // Confirm we're starting a track
+  UploadToServer(msg); // Confirm we're starting a track
 
   // Is it worth adding "show text message" feature?
   // SMS_Storage_Info_t storageInfo;
@@ -1126,7 +1226,7 @@ void gprs_Task(void* pData) {
       OLED_on();
       sprintf(stateMsg, "Reboot GPS...");
       Output(stateMsg);
-      updateScreen();
+      refreshScreen();
 
       // If we never locked, assume moved too far and full cold start
       if (fixcount == 0) {
@@ -1145,40 +1245,46 @@ void gprs_Task(void* pData) {
 #endif
 
     // Do we need a GPRS check/restart?
-    // bypass watchdog if we can't register so we'll just reboot everything.
     Network_GetActiveStatus(&status); // Is this reliable?
-    if (mob_on && status) {
+    if (mob_on && status) {           // Registered and activated
       // Have connection, so do uploading.
       // are we reconnecting with an SD cache?
       // flush that first
       int32_t fc = API_FS_Open("/t/cache", FS_O_RDONLY, 0);
       if (fc > 0) {
+#ifdef VERBOSE
         Output("Uploading cached");
+#endif
         int64_t  cachelen = API_FS_GetFileSize(fc);
-        uint8_t* cache    = OS_Malloc(cachelen + 16);
+        uint8_t* cache    = OS_Malloc(cachelen);
         if (cache) {
-          memset(cache, 0, cachelen + 1);
+          memset(cache, 0, cachelen);
           int32_t lenread = API_FS_Read(fc, (uint8_t*)cache, cachelen);
           API_FS_Close(fc);
           if (lenread) {
-            if (UploadToServer(cache, lenread)) {
-              API_FS_Delete("/t/cache"); // Only delete if
+            if (UploadToServer(cache)) {
+              API_FS_Delete("/t/cache"); // Only delete if all done
               dsk_on = false;
+            } else { // we'll end up resending some
             }
           }
+          OS_Free(cache);
         }
       }
 
-      // now upload our memory (~10mins)
-      if (strlen(sdbuffer)) {
+      // now upload our memory buffer (~10mins size)
+      // if we uploaded the SD cache
+      if (!dsk_on && strlen(sdbuffer)) {
+#ifdef VERBOSE
         Output("Uploading RAM");
-        ret = UploadToServer(sdbuffer, strlen(sdbuffer));
+#endif
+        ret = UploadToServer(sdbuffer);
         if (!ret) {
           strcpy(reason, "upload");
           Output("Unable to upload from RAM");
         } else {
-          SaveToSD();
-          sdbuffer[0] = 0; // Truncate
+          if (SaveToSDLog(sdbuffer)) // add to logfile
+            sdbuffer[0] = 0;         // Truncate
         }
       }
     } else {
@@ -1190,8 +1296,8 @@ void gprs_Task(void* pData) {
     if (!ret) // Check and retry upload again every minute.
     {
       Output("failed, retry in 1min");
-      sprintf(stateMsg, "Fail(%s) Retry", reason);
-      updateScreen();
+      sprintf(stateMsg, "Fail retry\n(%s)", reason);
+      refreshScreen();
 
       for (int pause = 60; pause > 0; pause--) {
         WatchDog_KeepAlive();
@@ -1199,23 +1305,25 @@ void gprs_Task(void* pData) {
       }
       ret = true;
     } else {
-      strcpy(stateMsg, "Running");
-      updateScreen();
+      strcpy(stateMsg, MSG_RUN);
+      refreshScreen();
 
       // slow down, chill and wait. seems to cause chaos. :(
       // Changing speed seems to cause issues
-      // PM_SetSysMinFreq(PM_SYS_FREQ_32K);
-      Output("Sleep for %d", config.upload);
+      PM_SetSysMinFreq(PM_SYS_FREQ_32K);
+#ifdef VERBOSE
+      Output("Sleep (slow) for %dm", config.upload / 60);
+#endif
       for (int pause = config.upload; pause > 0; pause--) {
         WatchDog_KeepAlive();
         OS_Sleep(1000); // check max sleep for 5min upload
       }
-      Output("Wakeup");
-      // PM_SetSysMinFreq(PM_SYS_FREQ_178M);
-      // OS_Sleep(1000); // short pause seems necessary if freq changed
+#ifdef VERBOSE
+      Output("Wakeup (fast)");
+#endif
+      PM_SetSysMinFreq(PM_SYS_FREQ_178M);
+      OS_Sleep(1000); // short pause seems necessary if freq changed
     }
-    // PM_SetSysMinFreq(PM_SYS_FREQ_178M);
-    // PM_SetSysMinFreq(PM_SYS_FREQ_312M);
   }
 }
 
@@ -1259,9 +1367,9 @@ void InitConfig() {
 
   // Sanity check SD card on powerup and dump contents for info/diags
   Output("Check SD");
-  ListDirsRoot("/");  // Show what's on TF
-  ListDirsRoot("/t"); // Show what's on SD
-  Output("SD OK");
+  if (ListDirsRoot("/") && // Show what's on TF
+      ListDirsRoot("/t"))  // Show what's on SD
+    Output("SD OK");
 
   if (!FileExists(GPS_LOG_FILE_PATH)) {
     int32_t fl = API_FS_Open(GPS_LOG_FILE_PATH, FS_O_RDWR | FS_O_CREAT, 0);
@@ -1270,14 +1378,17 @@ void InitConfig() {
       API_FS_Close(fl);
   }
 
-  do {
-    if (!ReadConfig() && !WriteConfig()) // Create default config if missing.
-      Flash(100);                        // Flicker light so we know its not running yes
-    else
-      break;
-    OS_Sleep(1000);
-  } while (1); // Fatal stuck
-
+  if (!ReadConfig() && !WriteConfig()) // Create default config if missing.
+  {
+    updateScreen("SD failure.\nPower off!!!");
+    // Fatal so stuck and poweroff
+    Flash(100);
+    Flash(100);
+    Flash(100);
+    Flash(100); // Flicker light so we know its not running yet
+    OS_Sleep(10000);
+    PowerOff(); // Bye bye
+  }
   if (config.loglevel & DEBUG) CreateLog(); // Empty logfile
 
   // preload last good state.
@@ -1307,30 +1418,33 @@ void appMainTask(void* pData) {
   PM_PowerEnable(POWER_TYPE_CAM, false);
 
   // Changing clock frequencies seems to cause GPRS instability/chaos.
-  // PM_SetSysMinFreq(PM_SYS_FREQ_312M); // Full speed startup any help?
-  // PM_SetSysMinFreq(PM_SYS_FREQ_178M);
+  //   PM_SetSysMinFreq(PM_SYS_FREQ_312M); // Full speed startup any help?
+  PM_SetSysMinFreq(PM_SYS_FREQ_178M);
 
   API_Event_t* event = NULL;
 
-  OLED_init();
+  if (!OLED_init()) Output("Unable to allocate screen.");
+
   drawString(0, 0, "Booting IvrTrac");
   drawString(0, 2, SOFT_VERSION);
   drawString(0, 4, "               ");
   drawString(0, 6, "#ONElove       ");
   OLED_show();
+  OS_Sleep(1000);
 
   UARTInit(); // Logging option
   SMSInit();  // Listen for SMS messages
 
-  sdbuffer = OS_Malloc(BUFFER_SIZE + 16); // memory allocator seems flaky? add
-                                          // some bytes (is it alignment buggy?)
-  if (!sdbuffer) Output("Cant create sdbuffer");
+  sdbuffer = OS_Malloc(BUFFER_SIZE);
+
+  if (!sdbuffer) {
+    Output("Cant create sdbuffer");
+    PM_ShutDown();
+  }
+
   memset(sdbuffer, 0, BUFFER_SIZE);
 
-  OS_Sleep(5000);
-
-  strcpy(stateMsg, "SD init");
-  updateScreen();
+  updateScreen("SD init");
   Output("GPS Monitor " SOFT_VERSION " running");
   InitConfig(); // Need defaults for handlers to start running
 
@@ -1346,10 +1460,10 @@ void appMainTask(void* pData) {
 
   TIME_SetIsAutoUpdateRtcTime(true);
 
-  Output("Starting tasks");
-  OS_CreateTask(gprs_Task, NULL, NULL, GPS_TASK_STACK_SIZE, MAIN_TASK_PRIORITY + 1, 0, 0, "GPRS Task");
+  updateScreen("Boot..");
 
-  OS_Sleep(2000); // Pause
+  Output("Starting tasks");
+  OS_CreateTask(gprs_Task, NULL, NULL, GPS_TASK_STACK_SIZE, MAIN_TASK_PRIORITY + 2, 0, 0, "GPRS Task");
 
   // Wait event
   while (1) {
