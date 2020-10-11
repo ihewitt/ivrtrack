@@ -197,7 +197,7 @@ void updateScreen(char* msg) {
 
   uint8_t  percent;
   uint16_t v = PM_Voltage(&percent);
-  sprintf(tmp, "%dmV %d\%", v, percent);
+  sprintf(tmp, "%dmV %d%%", v, percent);
   drawString(4, 6, tmp);
 
   if (percent > 80) drawIcon(14, 6, ICON_BAT_H);
@@ -566,7 +566,7 @@ void HandleGps() {
   char locstr[64];
   char batstr[12];
 
-  snprintf(batstr, sizeof(batstr), "%dmV, %d\%", v, percent);
+  snprintf(batstr, sizeof(batstr), "%dmV, %d%%", v, percent);
   snprintf(satstr, sizeof(satstr),
            "gsa: %d,%d "
            "qu: %d trk: %d tot: %d fix: %s %d",
@@ -611,7 +611,7 @@ bool handleCommand(bool  verbose, // verbose - sms or uart
     GPS_Info_t* gpsInfo = Gps_GetInfo();
 
     sprintf(response,
-            "GPRS %d, Power %dmV %d\%, "
+            "GPRS %d, Power %dmV %d%%, "
             "FIX %d, "
             "GPS %ds, UP %ds",
             status, v, percent, gpsInfo->gga.satellites_tracked, config.gps, config.upload);
