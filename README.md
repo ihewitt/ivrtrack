@@ -4,6 +4,8 @@ Uses SSD1306 OLED for display.
 
 More details at https://blog.ivor.org/2020/10/tracking-running-part-2.html
 
+The OLED fields: ![OLED](doc/oled.jpeg)
+
 # BUILDING
 
 With a setup A9G [GPRS SDK](https://ai-thinker-open.github.io/GPRS_C_SDK_DOC/en/c-sdk/installation_linux.html) directory, create code subdirectory "gps_monitor" then

@@ -757,8 +757,12 @@ void EventNetwork(API_Event_t* pEvent) {
       uint8_t status = 0; // do we need to attach or reactivate?
       if (Network_GetAttachStatus(&status)) Output("GetAttach %d vs attachflag %d", status, netAttach);
       if (status == 0) {
-        if (!Network_StartAttach()) Trace(1, "network attach fail");
-
+        while (status == 0) {
+          Output("Attach");
+          Network_StartAttach();
+          OS_Sleep(5000);
+          Network_GetAttachStatus(&status);
+        }
         break;
       }
       // drop through
@@ -766,6 +770,13 @@ void EventNetwork(API_Event_t* pEvent) {
     }
     case API_EVENT_ID_NETWORK_ATTACHED: {
       if (pEvent->id == API_EVENT_ID_NETWORK_ATTACHED) Output("Attached");
+      if (netAttach) {
+        Network_PDP_Context_t context = {                      // If we're reattaching, do a bad one first
+                                         .apn        = "none", // Seems to be necessary otherwise attach
+                                         .userName   = "",     // won't succeed. weird.
+                                         .userPasswd = ""};
+        Network_StartActive(context);
+      }
       netAttach = true;
 
       Output("Activate %s %s %s", config.apn, config.apnuser, config.apnpwd);
@@ -967,7 +978,9 @@ bool UploadToServer(char* data) {
   int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (fd < 0) {
     Output("Create socket fail"); // not sure how this could ever fail?
-    return false;                 // seems it can
+    // Forre reconnect?
+    Network_StartDetach(); // try a detach? then we'll need attach, activate
+    return false;          // seems it can
   }
 
   LED_data(true);
@@ -1156,7 +1169,7 @@ void gprs_Task(void* pData) {
 
   // 60 seconds might be too quick, try 3 min?
   // If we can't get GPRS in this time, start over
-  WatchDog_Open(WATCHDOG_SECOND_TO_TICK(60 * 3));
+  WatchDog_Open(WATCHDOG_SECOND_TO_TICK(60 * 2));
 
   strcpy(stateMsg, "GPRS Connect"); //
   refreshScreen();
@@ -1256,10 +1269,10 @@ void gprs_Task(void* pData) {
         Output("Uploading cached");
 #endif
         int64_t  cachelen = API_FS_GetFileSize(fc);
-        uint8_t* cache    = OS_Malloc(cachelen);
+        uint8_t* cache    = OS_Malloc(cachelen + 1);
         if (cache) {
-          memset(cache, 0, cachelen);
           int32_t lenread = API_FS_Read(fc, (uint8_t*)cache, cachelen);
+          cache[lenread]  = 0;
           API_FS_Close(fc);
           if (lenread) {
             if (UploadToServer(cache)) {
